@@ -1,0 +1,175 @@
+# Load model directly
+
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+import torch
+from datasets import load_dataset
+import pickle
+import os
+from tqdm.auto import tqdm
+import argparse
+import random
+random.seed(123)
+
+
+parser = argparse.ArgumentParser(description="Generate responses using a specified model.")
+parser.add_argument('--model_id', type=str, required=True, help='The model ID to use for generation.')
+parser.add_argument('--do_sample', type=bool, default=True, help='Whether to use sampling; use greedy decoding otherwise.')
+parser.add_argument('--temperature', type=float, default=0.8, help='The value used to module the next token probabilities.')
+parser.add_argument('--max_new_tokens', type=int, default=16384, help='The maximum number of new tokens to generate.')
+parser.add_argument('--top_k', type=int, default=50, help='The number of highest probability vocabulary tokens to keep for top-k-filtering.')
+parser.add_argument('--top_p', type=float, default=0.95, help='If set to float < 1, only the most probable tokens with probabilities that add up to top_p or higher are kept for generation.')
+parser.add_argument('--batch_size', type=int, default=32, help='The number of samples to process in a batch.')
+parser.add_argument('--min_p', type=float, default=0)
+parser.add_argument('--tensor_parallel_size', type=int, default=2, help='Number of GPUs to use for tensor parallelism.')
+parser.add_argument('--gpu_memory_utilization', type=float, default=0.9, help='GPU memory utilization for VLLM.')
+parser.add_argument('--download_dir', type=str, default='/n/holylabs/LABS/wattenberg_lab/Lab/pretrained_models/', help='Download directory for model weights.')
+parser.add_argument('--output_base_dir', type=str, default='outputs', help='Base directory for output files.')
+parser.add_argument('--backlog_base_dir', type=str, default='backlog/unfinished_thinking', help='Base directory for backlog files.')
+args = parser.parse_args()
+
+# Load the dataset
+
+ds_id = "Idavidrein/gpqa"
+split = "gpqa_diamond"
+ds = load_dataset(ds_id, split)
+
+# Define the model and tokenizer
+
+model_id = args.model_id
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+# Initialize VLLM model
+llm = LLM(
+    model=model_id,
+    tensor_parallel_size=args.tensor_parallel_size,
+    gpu_memory_utilization=args.gpu_memory_utilization,
+    trust_remote_code=True,
+    download_dir=args.download_dir,
+    max_model_len=None,  # Use model's default max length
+    dtype="auto",
+)
+
+# Create sampling parameters
+sampling_params = SamplingParams(
+    temperature=args.temperature if args.do_sample else 0.0,
+    top_p=args.top_p,
+    top_k=args.top_k,
+    max_tokens=args.max_new_tokens,
+    min_p=args.min_p,
+    stop_token_ids=None,
+)
+
+think_stop_id = tokenizer.vocab["</think>"]
+
+# Define the output folder
+
+dataset_name = ds_id.split("/")[-1]
+if split:
+    dataset_name += f"-{split}"
+model_name = model_id.split("/")[-1]
+output_folder = os.path.join(args.output_base_dir, f"{dataset_name}_same_order", model_name)
+if not os.path.exists(output_folder):
+    os.makedirs(output_folder)
+
+# Load unfinished IDs
+backlog_dir = os.path.join(args.backlog_base_dir, f"{ds_id.split('/')[-1]}_same_order")
+unfinished_ids = set()
+unfinished_file = os.path.join(backlog_dir, f"unfinished_thoughts_{model_name}.pkl")
+if os.path.exists(unfinished_file):
+    with open(unfinished_file, "rb") as f:
+        unfinished_ids.update(pickle.load(f))
+
+# Loop through the dataset sample by sample
+
+# Loop through the dataset in batches
+for i in range(0, len(ds['train']), args.batch_size):
+    # Get the current batch of prompts
+    batch_prompts = []
+    batch_indices = []
+    batch_orders = []
+    batch_formatted_prompts = []
+    
+    for j in range(args.batch_size):
+        if i + j >= len(ds['train']):
+            break
+        idx = i + j
+        question_id = idx
+        filename = f"{dataset_name}_question_id_{question_id}_{model_name}.txt"
+        
+        # Check if the output file already exists
+        if os.path.exists(os.path.join(output_folder, filename)) and question_id not in unfinished_ids:
+            continue
+
+        question = ds['train']['Question'][idx]
+        choices = [
+            ("Correct Answer", ds['train']['Correct Answer'][idx]),
+            ("Incorrect Answer 1", ds['train']['Incorrect Answer 1'][idx]),
+            ("Incorrect Answer 2", ds['train']['Incorrect Answer 2'][idx]),
+            ("Incorrect Answer 3", ds['train']['Incorrect Answer 3'][idx])
+        ]
+        
+        # Randomize the order of choices
+        random.shuffle(choices)
+        
+        # Extract the new order of choices with labels
+        new_order = [label for label, _ in choices]
+        
+        # Create the question prompt
+        question_prompt = f"What is the correct answer to this question: {question}\n"
+        question_prompt += "Choices:\n"
+        for letter, (_, choice) in zip(["A", "B", "C", "D"], choices):
+            question_prompt += f"({letter}) {choice}\n"
+        question_prompt += '\nFormat your response as follows: "The correct answer is (insert answer here)".'
+
+        batch_prompts.append(question_prompt)
+        batch_indices.append(idx)
+        batch_orders.append(new_order)
+        
+        # Format prompt for VLLM
+        messages = [{"role": "user", "content": question_prompt}]
+        formatted_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+        batch_formatted_prompts.append(formatted_prompt)
+
+    # Skip if no new prompts to process
+    if not batch_formatted_prompts:
+        continue
+
+    # Generate responses using VLLM
+    generated_outputs = llm.generate(batch_formatted_prompts, sampling_params)
+
+    for k, output in enumerate(generated_outputs):
+        generated_text = output.outputs[0].text
+        generated_tokens = output.outputs[0].token_ids
+        
+        # Parse thinking content
+        if think_stop_id in generated_tokens:
+            try:
+                index = len(generated_tokens) - generated_tokens[::-1].index(think_stop_id)
+            except ValueError:
+                index = 0
+        else:
+            index = len(generated_tokens)
+            
+        thinking_content = tokenizer.decode(generated_tokens[:index], skip_special_tokens=True).strip("\n")
+        content = tokenizer.decode(generated_tokens[index:], skip_special_tokens=True).strip("\n")
+        question_id = batch_indices[k]
+        filename = f"{dataset_name}_question_id_{question_id}_{model_name}.txt"
+        
+        with open(os.path.join(output_folder, filename), "w") as f:
+            f.write(f"### QUESTION: {batch_prompts[k]}\n\n")
+            f.write(f"### THINKING: {thinking_content}\n\n")
+            f.write(f"### ANSWER: {content}")
+
+        with open(os.path.join(output_folder, "choice_order_" + filename[:-4] + ".pkl"), "wb") as f:
+            pickle.dump(batch_orders[k], f)
+            
+        with open(os.path.join(output_folder, f"raw_output_{dataset_name}_question_id_{question_id}_{model_name}.txt"), "w") as f:
+            # For VLLM, we save the complete prompt + generated text
+            raw_output = batch_formatted_prompts[k] + generated_text
+            f.write(f"{raw_output}\n")
+
+        # Save the generated tokens to a pkl file
+        output_file = f"output_ids_{dataset_name}_question_id_{question_id}_{model_name}.pkl"
+        with open(os.path.join(output_folder, output_file), "wb") as f:
+            pickle.dump(generated_tokens, f) 

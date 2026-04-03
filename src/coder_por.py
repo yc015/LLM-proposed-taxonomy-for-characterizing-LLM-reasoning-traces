@@ -1,0 +1,1323 @@
+from src.coder_batch_trained import CoderBatchTrained
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.neighbors import KNeighborsClassifier
+from copy import deepcopy
+import os
+
+from tqdm.auto import tqdm
+from src.utils import fuzz_match
+from src.prompts.presence_of_reasoning_annotation_inst import CODE_INST, CORRECTION_INST
+
+
+class CoderPOR(CoderBatchTrained):
+    """
+    CoderPOR (Presence of Reasoning behaviors) - stores binary vector representations
+    of reasoning traces instead of summary statistics. Inherits from CoderBatchTrained
+    to enable accumulation-based training with _train_with_accumulation_stochastic_sampling.
+    """
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.code_occurrence_overall = {}
+        self.decision_code_occurence_overall = {}
+        self.no_check_after_update = True
+        self.code_inst = CODE_INST
+        self.correction_inst = CORRECTION_INST
+        
+        # Missing value imputation settings
+        self._extend_with_nan = False  # Whether to extend vectors with np.nan instead of 0
+        # if self._extend_with_nan:
+        # Imputation configuration
+        self._imputation_method = "knn"  # Options: "mean", "median", "most_frequent", "constant", "knn"
+        self._impute_after_accumulation = True
+        self._imputation_constant_value = 0  # Value to use for constant imputation (0 for binary)
+        self._knn_imputation_neighbors = 10  # Number of neighbors for KNN imputation        
+        
+    def _classify_prompt(self, outputs, question):
+        coding_prompt = f"You will be given two reasoning outputs sampled from two different models, and your task is to annotate the occurrence of the reasoning behaviors in the two reasoning outputs.\n\nYour annotation will be used to classify which language model generate which reasoning output.\n\nThe system message provides a reasoning behavior taxonomy that illustrates the reasoning difference between two language models.\n\nYour annotation should follow the definition of reasoning behaviors given in the system message.\n\nFollow the instruction in the system message and this message closely when making the annotation."
+
+        classification_prompt = """Your output should follow the format defined in the system message, annotating the occurrence of reasoning behaviors in each given OUTPUT."""
+
+        if hasattr(self, "run_type") and self.run_type == "VML":
+            coding_prompt = "You will be given two reasoning outputs sampled from two different models, and your task is to classify which models do these reasoning outputs belong to based on the distinguishing reasoning traits listed in the reasoning behavior taxonomy.\n\nThe system message provides a reasoning behavior taxonomy that illustrates the reasoning difference between two models. Follow the instruction and the reasoning behavior taxonomy in the system message and this message closely when making the classification."
+
+            classification_prompt = """Your output should follow the format defined in the system message, classifying the source language model of each given OUTPUT. """
+
+        if hasattr(self, "no_update_to_codebook") and self.no_update_to_codebook:
+            classification_prompt += "It's possible that a behavior occurrs in both outputs or does not occurr in any output." 
+        else:
+            classification_prompt += "If a reasoning behavior seems to occur in both outputs, see if any one of the outputs fits with the definition of that reasoning behavior more."
+
+        system_prompt = f"""{self.code_inst}\n"""
+        
+        for code in self.codebook.keys():
+            system_prompt += f"{code}: {self.codebook[code]}\n\n"
+
+        if self.think_budget > 0:
+            system_prompt += f"\nThink efficiently. Limit your thinking to {self.think_budget} words."
+
+        final_prompt = f"""{coding_prompt}\n\nGiven the ###OUTPUT A:\n{outputs[0]}\n-----End of OUTPUT A-----\n\nand ###OUTPUT B:\n{outputs[1]}\n-----End of OUTPUT B-----\n\n{classification_prompt}"""
+
+        if self.evaluation_method == "generative":
+            final_prompt += f"\n\nSelecting from models: " + ", ".join(self.model_options)
+
+            final_prompt += """which model generated the OUTPUT A and which model generated the OUTPUT B? Think step by step. Make sure you reply in this specific format so we can parse your classification results:\n"Because of the reasoning behaviors [Reasoning Behavior Name 1] ... [Reasoning Behavior Name X], the author model of OUTPUT A is [author model name]. Because of the reasoning behaviors [Reasoning Behavior Name 1] ... [Reasoning Behavior Name Y], the author model of OUTPUT B is [author model name]." Your final classification should not be biased by the order in which possible models appear in my prompt. Note that the given OUTPUTs are generated by two different models. If you determine that both OUTPUTs are likely generated by the same model, select the OUTPUT that most closely resembles that model's reasoning pattern."""
+        
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": final_prompt}
+        ]
+    
+    def _update_prompt(self, outputs, labels):
+        correction_prompt = "You will be given two reasoning outputs and the names of their author models. Given the current reasoning behavior taxonomy, think step by step, your task is to check if any new reasoning behaviors need to be added so you can make a correct classification on source language models that generate these two outputs.\n\n"
+
+        correction_prompt += f"Below is the ### OUTPUT A from {labels[0]}:\n{outputs[0]}\n-----End of OUTPUT A-----\n\n"
+
+        correction_prompt += f"Below is the ### OUTPUT B from {labels[1]}:\n{outputs[1]}\n-----End of OUTPUT B-----\n\n"
+
+        if self.current_annotation is not None:
+            correction_prompt += f"This is your annotation following the existing taxonomy:\n{self.current_annotation}\n\n"
+
+        correction_prompt += f"Follow the instruction in the system prompt and this message to update the reasoning behavior taxonomy.\n\nGive detailed definition and example for the updated and added reasoning behaviors!\n\n"
+
+        correction_prompt += f'At the end of your response, make sure you could confidently say that "Now, I will classify the author model based on the appeared reasoning behaviors.\n\nBecause of the reasoning behaviors [Reasoning Behavior Name 1] ... [Reasoning Behavior Name m], I can confidently say that the author model of OUTPUT A is {labels[0]}. Because of the reasoning behaviors [Reasoning Behavior Name 1] ... [Reasoning Behavior Name m], the author model of OUTPUT B is {labels[1]}." with the updated reasoning behavior taxonomy. Make sure your final output follows the format in the system message exactly.'
+
+        system_prompt = self.correction_inst
+        included_code = 0
+        for code in self.codebook.keys():
+            system_prompt += f"{code}: {self.codebook[code]}\n\n"
+            included_code += 1
+
+        if included_code < 1:
+            system_prompt += f"Current reasoning behavior taxonomy is empty. You should compare the reasoning traces and add new reasoning behavior into this reasoning behavior taxonomy!"
+
+            if self.initial_code_example is not None and len(self.initial_code_example.keys()) > 0:
+                system_prompt += "\n\nTo help you get started, below are example reasoning behaviors that illustrate the reasoning behaviors of an imagined language model Alpha. You should follow the format, style, and detailedness of these examples when generating the added and updated reasoning behaviors.\n\n"
+                for code in list(self.initial_code_example.keys()):
+                    system_prompt += f"{code}: {self.initial_code_example[code]}\n\n"
+
+        if self.think_budget > 0:
+            system_prompt += f"\n\nThink efficiently. Limit your thinking to {self.think_budget} words."
+
+        messages = [{"role": "system", "content": system_prompt},
+                    {"role": "user", "content": correction_prompt}]
+                    
+        return messages
+
+    def _impute_missing_values(self, results_dict):
+        """
+        Impute missing values in binary reasoning vectors.
+        For binary vectors, all imputed values are rounded to 0 or 1.
+        Imputation is performed separately for each model.
+        
+        Args:
+            results_dict (dict): The reasoning code representation dictionary
+        """
+        if 'vectors' not in results_dict or not results_dict['vectors']:
+            return
+        
+        # Get all vectors and labels
+        vector_keys = list(results_dict['vectors'].keys())
+        vectors = np.array([results_dict['vectors'][key] for key in vector_keys])
+        labels = results_dict['labels']
+        
+        # Check if there are any missing values
+        if not np.any(np.isnan(vectors)):
+            return
+        
+        print(f"Imputing missing values using {self._imputation_method} method (separately by model)...")
+        
+        # Group vectors by model
+        unique_models = list(set(labels))
+        imputed_results = {}
+        
+        for model in unique_models:
+            # Get indices and vectors for this model
+            model_indices = [i for i, label in enumerate(labels) if label == model]
+            if not model_indices:
+                continue
+                
+            model_vectors = vectors[model_indices]
+            model_keys = [vector_keys[i] for i in model_indices]
+            
+            # Skip if no missing values for this model
+            if not np.any(np.isnan(model_vectors)):
+                for i, key in enumerate(model_keys):
+                    imputed_results[key] = model_vectors[i]
+                continue
+            
+            print(f"  Imputing for model '{model}': {len(model_vectors)} vectors")
+            
+            # Choose imputation method
+            if self._imputation_method == "mean":
+                imputer = SimpleImputer(strategy='mean')
+            elif self._imputation_method == "median":
+                imputer = SimpleImputer(strategy='median')
+            elif self._imputation_method == "most_frequent":
+                imputer = SimpleImputer(strategy='most_frequent')
+            elif self._imputation_method == "constant":
+                imputer = SimpleImputer(strategy='constant', fill_value=self._imputation_constant_value)
+            elif self._imputation_method == "knn":
+                # Adjust k for small samples
+                k = min(self._knn_imputation_neighbors, len(model_vectors) - 1) if len(model_vectors) > 1 else 1
+                imputer = KNNImputer(n_neighbors=k)
+            else:
+                print(f"Unknown imputation method: {self._imputation_method}, falling back to mean")
+                imputer = SimpleImputer(strategy='mean')
+            
+            try:
+                if len(model_vectors) == 1:
+                    # Single sample: use zero imputation
+                    imputed_vectors = np.nan_to_num(model_vectors, nan=0.0)
+                    print(f"    Single sample for model '{model}', using zero imputation")
+                else:
+                    # Fit and transform the vectors for this model
+                    imputed_vectors = imputer.fit_transform(model_vectors)
+                    
+                    # Handle potential sparse matrix results
+                    if hasattr(imputed_vectors, 'toarray'):
+                        imputed_vectors = imputed_vectors.toarray()
+                    
+                    # Convert to binary by rounding (for binary vectors)
+                    imputed_vectors = np.round(imputed_vectors).astype(int)
+                
+                # Store imputed vectors
+                for i, key in enumerate(model_keys):
+                    imputed_results[key] = imputed_vectors[i]
+                
+                print(f"    Successfully imputed missing values for {len(model_keys)} vectors")
+                
+            except Exception as e:
+                print(f"    Error during imputation for model '{model}': {e}")
+                print(f"    Using zero imputation as fallback...")
+                for i, key in enumerate(model_keys):
+                    vector = model_vectors[i]
+                    imputed_results[key] = np.nan_to_num(vector, nan=0.0).astype(int)
+        
+        # Update the vectors in the results dictionary
+        for key, imputed_vector in imputed_results.items():
+            results_dict['vectors'][key] = imputed_vector
+        
+        print(f"Completed binary imputation for {len(unique_models)} models, {len(imputed_results)} total vectors")
+
+    def _update_code_occurence(self, results_dict, code_occurrence, sample_id=None, is_decision_code=False):
+        """
+        Override to store binary vectors instead of summary statistics.
+        Maintains consistent code ordering similar to CoderBOR.
+        """
+        if is_decision_code:
+            # Handle decision codes the same way as parent class
+            for code in code_occurrence.keys():
+                matched_code = fuzz_match(code, list(results_dict.keys()), 90, method="character")
+                if not matched_code:
+                    results_dict[code] = {}
+                    for model_option in self.model_options:
+                        results_dict[code][model_option] = 0
+                    matched_code = code
+
+                for model_option in self.model_options:
+                    if model_option not in code_occurrence[code].keys():
+                        continue
+                    if code_occurrence[code][model_option]: 
+                        results_dict[matched_code][model_option] += 1
+        else:
+            # Handle reasoning codes with binary vectors
+            self._update_reasoning_code_vectors(results_dict, code_occurrence, sample_id)
+    
+    def _update_reasoning_code_vectors(self, results_dict, code_occurrence, sample_id=None):
+        """
+        Update reasoning code representation by storing binary vectors for each sample.
+        Maintains consistent code ordering similar to CoderBOR.
+        """
+        # Initialize vector structure if needed
+        if 'vectors' not in results_dict:
+            results_dict['vectors'] = {}
+            results_dict['code_order'] = []  # Track order of codes for consistent vector indexing
+            results_dict['sample_ids'] = []
+            results_dict['labels'] = []
+        
+        # Get current codebook order
+        current_codes = list(self.codebook.keys()) if self.codebook else []
+        
+        if not current_codes:
+            return
+        
+        # If codebook has grown, extend existing vectors
+        if len(current_codes) > len(results_dict['code_order']):
+            self._extend_existing_vectors(results_dict, current_codes)
+        
+        # Update code order
+        results_dict['code_order'] = current_codes[:]
+        
+        # Extract model names from code_occurrence or use defaults
+        model_names = []
+        if code_occurrence:
+            first_code_data = next(iter(code_occurrence.values()))
+            if isinstance(first_code_data, dict):
+                model_names = list(first_code_data.keys())
+        
+        # Handle case where we don't have exactly 2 models
+        if len(model_names) >= 2:
+            model_a_name = model_names[0]
+            model_b_name = model_names[1]
+        else:
+            # Fallback to default names if structure is unexpected
+            # model_a_name = "OUTPUT A"
+            # model_b_name = "OUTPUT B"
+            return
+        
+        # Create binary vectors for this sample
+        vector_a = np.zeros(len(current_codes))
+        vector_b = np.zeros(len(current_codes))
+        
+        # Fill in binary values based on code occurrences
+        for code_name, occurrences in code_occurrence.items():
+            if code_name in current_codes:
+                code_idx = current_codes.index(code_name)
+                vector_a[code_idx] = 1 if occurrences.get(model_a_name, False) else 0
+                vector_b[code_idx] = 1 if occurrences.get(model_b_name, False) else 0
+        
+        # Store vectors with sample IDs as keys (similar to CoderBOR)
+        if sample_id:
+            key_a = f"{sample_id}_{model_a_name}"
+            key_b = f"{sample_id}_{model_b_name}"
+            if key_a not in results_dict['vectors']:
+                results_dict['sample_ids'].extend([key_a, key_b])
+                results_dict['labels'].extend([model_a_name, model_b_name])
+            results_dict['vectors'][key_a] = vector_a
+            results_dict['vectors'][key_b] = vector_b
+        else:
+            # Generate unique keys
+            base_key = f"sample_{len(results_dict['sample_ids'])//2}"
+            key_a = f"{base_key}_{model_a_name}"
+            key_b = f"{base_key}_{model_b_name}"
+            if key_a not in results_dict['vectors']:
+                results_dict['sample_ids'].extend([key_a, key_b])
+                results_dict['labels'].extend([model_a_name, model_b_name])
+            results_dict['vectors'][key_a] = vector_a
+            results_dict['vectors'][key_b] = vector_b
+    
+    def _extend_existing_vectors(self, results_dict, new_code_order):
+        """
+        Extend existing vectors when new codes are added to the codebook.
+        Similar to CoderBOR but for binary vectors.
+        """
+        if 'vectors' not in results_dict or not results_dict['vectors']:
+            return
+        
+        old_length = len(results_dict.get('code_order', []))
+        new_length = len(new_code_order)
+        
+        if new_length <= old_length:
+            return
+        
+        # Determine fill value based on extension method
+        fill_value = np.nan if self._extend_with_nan else 0
+        
+        # Extend all existing vectors with zeros or NaN for new codes
+        for key, vector in results_dict['vectors'].items():
+            current_length = len(vector)
+            if current_length >= new_length:
+                # Vector is already the right size or larger
+                continue
+                
+            extended_vector = np.full(new_length, fill_value)
+            extended_vector[:current_length] = vector
+            results_dict['vectors'][key] = extended_vector
+    
+    def _update_code_occurence_with_labels(self, results_dict, code_occurrence, labels, sample_id=None):
+        """
+        Helper method to update with known labels, using the new vector structure.
+        """
+        # For regular reasoning codes, use the vector update method
+        self._update_reasoning_code_vectors(results_dict, code_occurrence, sample_id)
+    
+
+    
+    def _soft_voting_classification(self, classification, print_details=True, return_scores=False, follow_the_annotation=True):
+        """
+        Override soft voting to work with vector representations.
+        
+        Args:
+            classification (str): The classification output text
+            print_details (bool): Whether to print detailed information
+            return_scores (bool): Whether to return probability scores
+            follow_the_annotation (bool): If True, only consider codes that appear in the parsed annotation.
+                                        If False, assume unmentioned codes are absent.
+        """
+        code_occurrences = self._parse_codes_occurence(classification)
+        
+        # Get training data - use most recent if available
+        if self._most_recent_code_occurrence_overall_train is not None:
+            train_data = self._most_recent_code_occurrence_overall_train
+        else:
+            train_data = self.code_occurrence_overall["train"]
+        
+        # Get current code order
+        current_codes = train_data.get('code_order', list(self.codebook.keys())) 
+        
+        # Create test vectors for current outputs
+        if follow_the_annotation:
+            # Only consider codes that appear in the annotation
+            relevant_codes = [code for code in current_codes if code in code_occurrences]
+            if not relevant_codes:
+                # If no codes in annotation, fall back to generative classification
+                return self._generative_classification(classification, print_details=print_details)
+            
+            # Create vectors only for annotated codes
+            test_vector_a = []
+            test_vector_b = []
+            train_vectors_filtered = []
+            
+            for code_name in relevant_codes:
+                if code_name in current_codes:
+                    code_idx = current_codes.index(code_name)
+                    test_vector_a.append(1 if code_occurrences[code_name].get("OUTPUT A", False) else 0)
+                    test_vector_b.append(1 if code_occurrences[code_name].get("OUTPUT B", False) else 0)
+            
+            # Filter training vectors to only include relevant code dimensions
+            train_vectors_full = np.array(list(train_data['vectors'].values()))
+            relevant_indices = [current_codes.index(code) for code in relevant_codes if code in current_codes]
+            train_vectors_filtered = train_vectors_full[:, relevant_indices]
+            
+            test_vector_a = np.array(test_vector_a)
+            test_vector_b = np.array(test_vector_b)
+            train_vectors = train_vectors_filtered
+        else:
+            # Original behavior: consider all codes, assume unmentioned codes are absent
+            test_vector_a = np.zeros(len(current_codes))
+            test_vector_b = np.zeros(len(current_codes))
+            
+            for code_name, occurrences in code_occurrences.items():
+                if code_name in current_codes:
+                    code_idx = current_codes.index(code_name)
+                    test_vector_a[code_idx] = 1 if occurrences.get("OUTPUT A", False) else 0
+                    test_vector_b[code_idx] = 1 if occurrences.get("OUTPUT B", False) else 0
+            
+            train_vectors = np.array(list(train_data['vectors'].values()))
+        
+        # Get labels from training data
+        train_labels = np.array(train_data['labels'])
+        
+        # Calculate probabilities for each model based on training data
+        prob_A = np.zeros(len(self.model_options))
+        prob_B = np.zeros(len(self.model_options))
+        
+        for i, model in enumerate(self.model_options):
+            model_vectors = train_vectors[train_labels == model]
+            if len(model_vectors) > 0:
+                # For each code dimension, calculate P(code=1|model) and P(code=0|model)
+                prob_code_given_model = np.mean(model_vectors, axis=0)
+                # Add small epsilon to avoid zero probabilities
+                eps = 1e-10
+                prob_code_given_model = np.clip(prob_code_given_model, eps, 1-eps)
+                
+                # Calculate likelihood of test vectors
+                prob_A[i] = np.prod(prob_code_given_model * test_vector_a + (1 - prob_code_given_model) * (1 - test_vector_a))
+                prob_B[i] = np.prod(prob_code_given_model * test_vector_b + (1 - prob_code_given_model) * (1 - test_vector_b))
+        
+        # Normalize probabilities
+        if np.sum(prob_A) > 0:
+            prob_A = prob_A / np.sum(prob_A)
+        if np.sum(prob_B) > 0:
+            prob_B = prob_B / np.sum(prob_B)
+        
+        # Make predictions
+        pred_A = self.model_options[np.argmax(prob_A)]
+        pred_B = self.model_options[np.argmax(prob_B)]
+        
+        # Ensure different predictions
+        if pred_A == pred_B:
+            # Assign based on confidence
+            if prob_A[np.argmax(prob_A)] > prob_B[np.argmax(prob_B)]:
+                pred_B = self.model_options[1 - np.argmax(prob_A)]
+            else:
+                pred_A = self.model_options[1 - np.argmax(prob_B)]
+        
+        if print_details:
+            print(f"Soft Voting - OUTPUT A: {pred_A} (prob: {prob_A})", flush=True)
+            print(f"Soft Voting - OUTPUT B: {pred_B} (prob: {prob_B})", flush=True)
+        
+        if return_scores:
+            return pred_A, pred_B, prob_A.tolist(), prob_B.tolist()
+        return pred_A, pred_B
+    
+    def _logistic_regression_classification(self, classification, print_details=True, return_scores=False):
+        """
+        Override logistic regression to work with vector representations.
+        """
+        code_occurrences = self._parse_codes_occurence(classification)
+        
+        # Get training data - use most recent if available
+        if self._most_recent_code_occurrence_overall_train is not None:
+            train_data = self._most_recent_code_occurrence_overall_train
+        else:
+            train_data = self.code_occurrence_overall["train"]
+
+        
+        all_codes = train_data.get('code_order', list(self.codebook.keys()))
+        
+        if not all_codes:
+            raise ValueError("No codes found in codebook.")
+
+        # Ensure all vectors have the same length (fix for codebook growth)
+        expected_length = len(all_codes)
+        for key, vec in train_data['vectors'].items():
+            if len(vec) != expected_length:
+                extended_vector = np.zeros(expected_length)
+                extended_vector[:len(vec)] = vec
+                train_data['vectors'][key] = extended_vector
+        
+        X_train = np.array(list(train_data["vectors"].values()))
+        y_train = np.array(train_data["labels"])
+        
+        if len(X_train) < 2:
+            print("Not enough training data for logistic regression. Falling back to generative classification.")
+            raise ValueError("Not enough training data for logistic regression.")
+            
+        
+        unique_classes = np.unique(y_train)
+        if len(unique_classes) < 2:
+            print("Not enough training data for logistic regression. Falling back to generative classification.")
+            raise ValueError("Not enough training data for logistic regression.")
+            
+        
+        # Train logistic regression
+        clf = LogisticRegression(random_state=42, max_iter=1000)
+        try:
+            clf.fit(X_train, y_train)
+        except Exception as e:
+            print(f"Logistic regression failed: {e}. Falling back to generative classification.")
+            return self._generative_classification(classification, print_details=print_details)
+        
+        # Create feature vectors for current outputs
+        X_test = []
+        for output_name in ["OUTPUT A", "OUTPUT B"]:
+            feature_vector = []
+            for code in all_codes:
+                if code in code_occurrences:
+                    feature_vector.append(1 if code_occurrences[code].get(output_name, False) else 0)
+                else:
+                    feature_vector.append(0)
+            X_test.append(feature_vector)
+        
+        X_test = np.array(X_test)
+        
+        # Make predictions
+        predictions = clf.predict(X_test)
+        probabilities = clf.predict_proba(X_test)
+        
+        pred_A, pred_B = predictions[0], predictions[1]
+        prob_A, prob_B = probabilities[0], probabilities[1]
+        
+        # Ensure different predictions
+        if pred_A == pred_B:
+            class_labels = clf.classes_
+            if len(self.model_options) >= 2:
+                model0_idx = list(class_labels).index(self.model_options[0]) if self.model_options[0] in class_labels else 0
+                confidence_A_model0 = prob_A[model0_idx] if model0_idx < len(prob_A) else 0.5
+                confidence_B_model0 = prob_B[model0_idx] if model0_idx < len(prob_B) else 0.5
+                
+                if confidence_A_model0 > confidence_B_model0:
+                    pred_A, pred_B = self.model_options[0], self.model_options[1]
+                else:
+                    pred_A, pred_B = self.model_options[1], self.model_options[0]
+        
+        if print_details:
+            print(f"Logistic Regression - Training samples: {len(X_train)}, Features: {len(all_codes)}", flush=True)
+            # print(f"OUTPUT A prediction: {pred_A} (max confidence: {max(prob_A):.3f})", flush=True)
+            # print(f"OUTPUT B prediction: {pred_B} (max confidence: {max(prob_B):.3f})", flush=True)
+            print(f"Logistic Regression - OUTPUT A probabilities: {dict(zip(self.model_options, prob_A))}")
+            print(f"Logistic Regression - OUTPUT B probabilities: {dict(zip(self.model_options, prob_B))}")
+
+        if return_scores:
+            return pred_A, pred_B, prob_A.tolist(), prob_B.tolist()
+        return pred_A, pred_B
+
+    def _knn_classification(self, classification, print_details=True, return_scores=False, k=5):
+        """
+        K-Nearest Neighbors classification using vector representations.
+        
+        Args:
+            classification (str): The classification output text
+            print_details (bool): Whether to print detailed information
+            return_scores (bool): Whether to return probability scores
+            k (int): Number of nearest neighbors to use (default: 5)
+        
+        Returns:
+            tuple: (pred_A, pred_B) or (pred_A, pred_B, scores_A, scores_B) if return_scores=True
+        """
+        
+        code_occurrences = self._parse_codes_occurence(classification)
+
+        # Get training data - use most recent if available
+        if self._most_recent_code_occurrence_overall_train is not None:
+            train_data = self._most_recent_code_occurrence_overall_train
+        else:
+            train_data = self.code_occurrence_overall["train"]
+        
+        # Get current code order
+        current_codes = train_data.get('code_order', list(self.codebook.keys()))
+        
+        if not current_codes:
+            raise ValueError("No codes found in codebook.")
+        
+        # Ensure all vectors have the same length (fix for codebook growth)
+        expected_length = len(current_codes)
+        for key, vec in train_data['vectors'].items():
+            if len(vec) != expected_length:
+                extended_vector = np.zeros(expected_length)
+                extended_vector[:len(vec)] = vec
+                train_data['vectors'][key] = extended_vector
+        
+        X_train = np.array(list(train_data["vectors"].values()))
+        y_train = np.array(train_data["labels"])
+        
+        if len(X_train) < 2:
+            print("Not enough training data for KNN classification. Falling back to generative classification.")
+            return self._generative_classification(classification, print_details=print_details)
+        
+        unique_classes = np.unique(y_train)
+        if len(unique_classes) < 2:
+            print("Not enough class diversity for KNN classification. Falling back to generative classification.")
+            return self._generative_classification(classification, print_details=print_details)
+        
+        # Adjust k based on available training data
+        k_effective = min(k, len(X_train))
+        
+        # Create feature vectors for current outputs
+        test_vector_a = np.zeros(len(current_codes))
+        test_vector_b = np.zeros(len(current_codes))
+        
+        for code_name, occurrences in code_occurrences.items():
+            if code_name in current_codes:
+                code_idx = current_codes.index(code_name)
+                test_vector_a[code_idx] = 1 if occurrences.get("OUTPUT A", False) else 0
+                test_vector_b[code_idx] = 1 if occurrences.get("OUTPUT B", False) else 0
+        
+        X_test = np.array([test_vector_a, test_vector_b])
+        
+        # Train KNN classifier
+        try:
+            knn = KNeighborsClassifier(n_neighbors=k_effective)
+            knn.fit(X_train, y_train)
+            
+            # Make predictions
+            predictions = knn.predict(X_test)
+            probabilities = knn.predict_proba(X_test)
+            
+            pred_A, pred_B = predictions[0], predictions[1]
+            prob_A, prob_B = probabilities[0], probabilities[1]
+            
+        except Exception as e:
+            print(f"KNN classification failed: {e}. Falling back to generative classification.")
+            return self._generative_classification(classification, print_details=print_details)
+        
+        # Ensure different predictions
+        if pred_A == pred_B:
+            # Calculate distances to nearest neighbors of each class for tie-breaking
+            class_labels = knn.classes_
+            if len(self.model_options) >= 2:
+                model0_idx = list(class_labels).index(self.model_options[0]) if self.model_options[0] in class_labels else 0
+                confidence_A_model0 = prob_A[model0_idx] if model0_idx < len(prob_A) else 0.5
+                confidence_B_model0 = prob_B[model0_idx] if model0_idx < len(prob_B) else 0.5
+                
+                if confidence_A_model0 > confidence_B_model0:
+                    pred_A, pred_B = self.model_options[0], self.model_options[1]
+                else:
+                    pred_A, pred_B = self.model_options[1], self.model_options[0]
+        
+        if print_details:
+            print(f"KNN Classification (k={k_effective}) - Training samples: {len(X_train)}, Features: {len(current_codes)}", flush=True)
+            print(f"KNN - OUTPUT A probabilities: {dict(zip(self.model_options, prob_A))}")
+            print(f"KNN - OUTPUT B probabilities: {dict(zip(self.model_options, prob_B))}")
+        
+        if return_scores:
+            return pred_A, pred_B, prob_A.tolist(), prob_B.tolist()
+        return pred_A, pred_B
+
+
+    
+    def _hard_voting_classification(self, classification, print_details=True, return_scores=False):
+        """
+        Override hard voting to work with vector representations.
+        """
+        code_occurrences = self._parse_codes_occurence(classification)
+        
+        # Get training data - use most recent if available
+        if self._most_recent_code_occurrence_overall_train is not None:
+            train_data = self._most_recent_code_occurrence_overall_train
+        else:
+            train_data = self.code_occurrence_overall["train"]
+        
+        train_vectors = np.array(list(train_data["vectors"].values()))
+        train_labels = np.array(train_data["labels"])
+        all_codes = train_data.get('code_order', list(self.codebook.keys()))
+        
+        # Initialize code counts for each output and model
+        codes_A_model0 = 0
+        codes_A_model1 = 0
+        codes_B_model0 = 0
+        codes_B_model1 = 0
+        valid_codes_count = 0
+        
+        # Count codes for each output
+        for i, code_name in enumerate(all_codes):
+            if i >= train_vectors.shape[1]:  # Skip if not enough features
+                continue
+            
+            # Count occurrences for this code position in training data
+            model0_mask = train_labels == self.model_options[0]
+            model1_mask = train_labels == self.model_options[1]
+            
+            count_model0 = np.sum(train_vectors[model0_mask, i])
+            count_model1 = np.sum(train_vectors[model1_mask, i])
+            total_count = count_model0 + count_model1
+            
+            # Skip codes with no historical data
+            if total_count == 0:
+                continue
+            
+            # Determine which model the code is more associated with
+            if count_model0 > count_model1:
+                model0_associated = True
+            elif count_model1 > count_model0:
+                model0_associated = False
+            else:
+                # Equal association, skip this code for hard voting
+                continue
+            
+            # Check if code occurs in current classification
+            code_occurs_A = code_occurrences.get(code_name, {}).get("OUTPUT A", False)
+            code_occurs_B = code_occurrences.get(code_name, {}).get("OUTPUT B", False)
+            
+            # Count codes
+            if code_occurs_A:
+                if model0_associated:
+                    codes_A_model0 += 1
+                else:
+                    codes_A_model1 += 1
+            
+            if code_occurs_B:
+                if model0_associated:
+                    codes_B_model0 += 1
+                else:
+                    codes_B_model1 += 1
+            
+            valid_codes_count += 1
+        
+        if valid_codes_count == 0:
+            raise ValueError("No valid codes found.")
+            return self._generative_classification(classification, print_details=print_details)
+        
+        # Make predictions based on code counts
+        if codes_A_model0 > codes_A_model1:
+            initial_pred_A = self.model_options[0]
+        elif codes_A_model1 > codes_A_model0:
+            initial_pred_A = self.model_options[1]
+        else:
+            initial_pred_A = self.model_options[0]  # Tie, default to first model
+        
+        if codes_B_model0 > codes_B_model1:
+            initial_pred_B = self.model_options[0]
+        elif codes_B_model1 > codes_B_model0:
+            initial_pred_B = self.model_options[1]
+        else:
+            initial_pred_B = self.model_options[0]  # Tie, default to first model
+        
+        # Ensure different predictions
+        if initial_pred_A == initial_pred_B:
+            if initial_pred_A == self.model_options[0]:
+                if codes_A_model0 > codes_B_model0:
+                    pred_A, pred_B = self.model_options[0], self.model_options[1]
+                else:
+                    pred_A, pred_B = self.model_options[1], self.model_options[0]
+            else:
+                if codes_A_model1 > codes_B_model1:
+                    pred_A, pred_B = self.model_options[1], self.model_options[0]
+                else:
+                    pred_A, pred_B = self.model_options[0], self.model_options[1]
+        else:
+            pred_A, pred_B = initial_pred_A, initial_pred_B
+        
+        if print_details:
+            print(f"OUTPUT A code counts - {self.model_options[0]}: {codes_A_model0}, {self.model_options[1]}: {codes_A_model1}", flush=True)
+            print(f"OUTPUT B code counts - {self.model_options[0]}: {codes_B_model0}, {self.model_options[1]}: {codes_B_model1}", flush=True)
+            print(f"Valid codes used: {valid_codes_count}", flush=True)
+        
+        if return_scores:
+            return pred_A, pred_B, [codes_A_model0, codes_A_model1], [codes_B_model0, codes_B_model1]
+        return pred_A, pred_B
+    
+    def _naive_bayes_classification(self, classification, smoothing=1e-6, 
+                                    follow_code_occurrence_exactly=False, print_details=True, return_scores=False):
+        """
+        Override naive Bayes to work with vector representations.
+        """
+        code_occurrences = self._parse_codes_occurence(classification)
+        
+        # Get training data - use most recent if available
+        if self._most_recent_code_occurrence_overall_train is not None:
+            train_data = self._most_recent_code_occurrence_overall_train
+        else:
+            train_data = self.code_occurrence_overall["train"]
+        
+        train_vectors = np.array(list(train_data["vectors"].values()))
+        train_labels = np.array(train_data["labels"])
+        all_codes = train_data.get('code_order', list(self.codebook.keys()))
+        
+        # Calculate total outputs per model
+        model0_mask = train_labels == self.model_options[0]
+        model1_mask = train_labels == self.model_options[1]
+        total_outputs_model0 = np.sum(model0_mask)
+        total_outputs_model1 = np.sum(model1_mask)
+        
+        # Calculate prior probabilities
+        total_outputs = total_outputs_model0 + total_outputs_model1
+        prior_model0 = total_outputs_model0 / total_outputs
+        prior_model1 = total_outputs_model1 / total_outputs
+        
+        # Initialize log probabilities
+        log_prob_A_model0 = np.log(prior_model0)
+        log_prob_A_model1 = np.log(prior_model1)
+        log_prob_B_model0 = np.log(prior_model0)
+        log_prob_B_model1 = np.log(prior_model1)
+        
+        # For each code, calculate P(feature | model)
+        for i, code_name in enumerate(all_codes):
+            if i >= train_vectors.shape[1]:  # Skip if not enough features
+                continue
+            
+            # Get counts for this code position
+            count_model0 = np.sum(train_vectors[model0_mask, i])
+            count_model1 = np.sum(train_vectors[model1_mask, i])
+            
+            # Calculate P(feature=1 | model) with Laplace smoothing
+            prob_feature_given_model0 = (count_model0 + smoothing) / (total_outputs_model0 + 2 * smoothing)
+            prob_feature_given_model1 = (count_model1 + smoothing) / (total_outputs_model1 + 2 * smoothing)
+            
+            # Calculate P(feature=0 | model)
+            prob_no_feature_given_model0 = 1 - prob_feature_given_model0
+            prob_no_feature_given_model1 = 1 - prob_feature_given_model1
+            
+            # Check if code occurs in current classification
+            if follow_code_occurrence_exactly and (code_name not in code_occurrences.keys()):
+                continue
+            
+            feature_A = code_occurrences.get(code_name, {}).get("OUTPUT A", False)
+            if feature_A:
+                log_prob_A_model0 += np.log(prob_feature_given_model0)
+                log_prob_A_model1 += np.log(prob_feature_given_model1)
+            else:
+                log_prob_A_model0 += np.log(prob_no_feature_given_model0)
+                log_prob_A_model1 += np.log(prob_no_feature_given_model1)
+            
+            feature_B = code_occurrences.get(code_name, {}).get("OUTPUT B", False)
+            if feature_B:
+                log_prob_B_model0 += np.log(prob_feature_given_model0)
+                log_prob_B_model1 += np.log(prob_feature_given_model1)
+            else:
+                log_prob_B_model0 += np.log(prob_no_feature_given_model0)
+                log_prob_B_model1 += np.log(prob_no_feature_given_model1)
+        
+        # Convert to probabilities and normalize
+        prob_A_model0 = np.exp(log_prob_A_model0)
+        prob_A_model1 = np.exp(log_prob_A_model1)
+        prob_B_model0 = np.exp(log_prob_B_model0)
+        prob_B_model1 = np.exp(log_prob_B_model1)
+        
+        norm_A = prob_A_model0 + prob_A_model1
+        norm_B = prob_B_model0 + prob_B_model1
+        
+        if norm_A > 0:
+            prob_A_model0 /= norm_A
+            prob_A_model1 /= norm_A
+        
+        if norm_B > 0:
+            prob_B_model0 /= norm_B
+            prob_B_model1 /= norm_B
+        
+        # Make predictions ensuring outputs are from different models
+        initial_pred_A = self.model_options[0] if log_prob_A_model0 > log_prob_A_model1 else self.model_options[1]
+        initial_pred_B = self.model_options[0] if log_prob_B_model0 > log_prob_B_model1 else self.model_options[1]
+        
+        # Ensure different predictions
+        if initial_pred_A == initial_pred_B:
+            if initial_pred_A == self.model_options[0]:
+                if log_prob_A_model0 > log_prob_B_model0:
+                    pred_A, pred_B = self.model_options[0], self.model_options[1]
+                else:
+                    pred_A, pred_B = self.model_options[1], self.model_options[0]
+            else:
+                if log_prob_A_model1 > log_prob_B_model1:
+                    pred_A, pred_B = self.model_options[1], self.model_options[0]
+                else:
+                    pred_A, pred_B = self.model_options[0], self.model_options[1]
+        else:
+            pred_A, pred_B = initial_pred_A, initial_pred_B
+        
+        if print_details:
+            print(f"Prior probabilities - {self.model_options[0]}: {prior_model0:.3f}, {self.model_options[1]}: {prior_model1:.3f}", flush=True)
+            print(f"OUTPUT A probabilities - {self.model_options[0]}: {prob_A_model0:.3f}, {self.model_options[1]}: {prob_A_model1:.3f}", flush=True)
+            print(f"OUTPUT B probabilities - {self.model_options[0]}: {prob_B_model0:.3f}, {self.model_options[1]}: {prob_B_model1:.3f}", flush=True)
+        
+        if return_scores:
+            return pred_A, pred_B, [prob_A_model0, prob_A_model1], [prob_B_model0, prob_B_model1]
+        return pred_A, pred_B
+
+    def _similarity_based_classification(self, classification, metric='euclidean', print_details=True, return_scores=False):
+        """
+        Classify by comparing vectors for current outputs to the average vectors of each model.
+        """
+        train_data = self._most_recent_code_occurrence_overall_train if self._most_recent_code_occurrence_overall_train is not None else self.code_occurrence_overall.get("train", {})
+
+        if 'vectors' not in train_data or not train_data['vectors']:
+            print("Fall back to generative classification")
+            return self._generative_classification(classification, print_details)
+
+        current_codes = train_data.get('code_order', list(self.codebook.keys()))
+        if not current_codes:
+            return self._generative_classification(classification, print_details)
+
+        expected_length = len(current_codes)
+
+        # Ensure vectors match current code length
+        for key, vec in train_data['vectors'].items():
+            if len(vec) != expected_length:
+                extended_vector = np.zeros(expected_length)
+                extended_vector[:len(vec)] = vec
+                train_data['vectors'][key] = extended_vector
+
+        train_vectors = np.array(list(train_data['vectors'].values()))
+        train_labels = np.array(train_data['labels'])
+
+        if train_vectors.size == 0:
+            return self._generative_classification(classification, print_details)
+
+        model0_mask = train_labels == self.model_options[0]
+        model1_mask = train_labels == self.model_options[1]
+
+        if not model0_mask.any() or not model1_mask.any():
+            return self._generative_classification(classification, print_details)
+
+        center_model0 = np.nanmean(train_vectors[model0_mask], axis=0)
+        center_model1 = np.nanmean(train_vectors[model1_mask], axis=0)
+
+        center_model0 = np.nan_to_num(center_model0, nan=0.0)
+        center_model1 = np.nan_to_num(center_model1, nan=0.0)
+
+        code_occurrences = self._parse_codes_occurence(classification)
+        vector_a = np.zeros(expected_length)
+        vector_b = np.zeros(expected_length)
+
+        for code_name, occurrences in code_occurrences.items():
+            if code_name in current_codes:
+                idx = current_codes.index(code_name)
+                vector_a[idx] = 1 if occurrences.get("OUTPUT A", False) else 0
+                vector_b[idx] = 1 if occurrences.get("OUTPUT B", False) else 0
+
+        def cosine_sim(u, v):
+            denom = np.linalg.norm(u) * np.linalg.norm(v)
+            return float(np.dot(u, v) / denom) if denom != 0 else 0.0
+
+        if metric == 'cosine':
+            sim_a_model0 = cosine_sim(vector_a, center_model0)
+            sim_a_model1 = cosine_sim(vector_a, center_model1)
+            sim_b_model0 = cosine_sim(vector_b, center_model0)
+            sim_b_model1 = cosine_sim(vector_b, center_model1)
+        else:
+            dist_a_model0 = np.linalg.norm(vector_a - center_model0)
+            dist_a_model1 = np.linalg.norm(vector_a - center_model1)
+            dist_b_model0 = np.linalg.norm(vector_b - center_model0)
+            dist_b_model1 = np.linalg.norm(vector_b - center_model1)
+
+            sim_a_model0 = 1 / (1 + dist_a_model0)
+            sim_a_model1 = 1 / (1 + dist_a_model1)
+            sim_b_model0 = 1 / (1 + dist_b_model0)
+            sim_b_model1 = 1 / (1 + dist_b_model1)
+
+        pred_a = self.model_options[0] if sim_a_model0 > sim_a_model1 else self.model_options[1]
+        pred_b = self.model_options[0] if sim_b_model0 > sim_b_model1 else self.model_options[1]
+
+        # Ensure outputs map to different models
+        if pred_a == pred_b:
+            if pred_a == self.model_options[0]:
+                if sim_a_model0 <= sim_b_model0:
+                    pred_a, pred_b = self.model_options[1], self.model_options[0]
+            else:
+                if sim_a_model1 <= sim_b_model1:
+                    pred_a, pred_b = self.model_options[0], self.model_options[1]
+
+        if print_details:
+            metric_name = "Cosine" if metric == 'cosine' else "Euclidean"
+            print(f"{metric_name} similarity - OUTPUT A: {self.model_options[0]}={sim_a_model0:.3f}, {self.model_options[1]}={sim_a_model1:.3f}")
+            print(f"{metric_name} similarity - OUTPUT B: {self.model_options[0]}={sim_b_model0:.3f}, {self.model_options[1]}={sim_b_model1:.3f}")
+
+        if return_scores:
+            return pred_a, pred_b, [sim_a_model0, sim_a_model1], [sim_b_model0, sim_b_model1]
+        return pred_a, pred_b
+
+    def _evaluate_classification(self, classification, labels, print_details=True):
+        """
+        Override evaluation to support similarity-based methods.
+        """
+        if self.evaluation_method == "generative":
+            model_a, model_b = self._generative_classification(classification, print_details=print_details)
+        elif self.evaluation_method == "hard_vote":
+            model_a, model_b = self._hard_voting_classification(classification, print_details=print_details)
+        elif self.evaluation_method == "soft_vote":
+            model_a, model_b = self._soft_voting_classification(classification, print_details=print_details)
+        elif self.evaluation_method == "naive_bayes":
+            model_a, model_b = self._naive_bayes_classification(classification, 
+                                                                follow_code_occurrence_exactly=self.follow_codebook_nbc,
+                                                                print_details=print_details)
+        elif self.evaluation_method == "knn":
+            model_a, model_b = self._knn_classification(classification, print_details=print_details, k=5)
+        elif self.evaluation_method == "logistic_regression":
+            model_a, model_b = self._logistic_regression_classification(classification, print_details=print_details)
+        elif self.evaluation_method == "cosine_similarity":
+            model_a, model_b = self._similarity_based_classification(classification, metric='cosine', print_details=print_details)
+        elif self.evaluation_method == "euclidean_similarity":
+            model_a, model_b = self._similarity_based_classification(classification, metric='euclidean', print_details=print_details)
+        else:
+            model_a, model_b = self._generative_classification(classification, print_details=print_details)
+
+        if print_details:
+            print("Ground Truth:", flush=True)
+            print(f"OUTPUT A: {labels[0]}; OUTPUT B: {labels[1]}", flush=True)
+            print(f"Classification:", flush=True)
+            print(f"OUTPUT A: {model_a}; OUTPUT B: {model_b}\n", flush=True)
+
+        if model_a == labels[0] and model_b == labels[1]:
+            return "correct", [model_a, model_b]
+        elif model_a != labels[0] and model_b == labels[1]:
+            return "Model A wrong", [model_a, model_b]
+        elif model_a == labels[0] and model_b != labels[1]:
+            return "Model B wrong", [model_a, model_b]
+        else:
+            return "Both wrong", [model_a, model_b]
+    
+    def prune_codebook(self, method="top_k", **kwargs):
+        """
+        Override pruning to work with vector representations.
+        """
+        if method == "frequency":
+            self._prune_codebook_frequency_vectors(**kwargs)
+        elif method == "top_k":
+            self._prune_codebook_top_k_vectors(**kwargs)
+        else:
+            print(f"Unknown pruning method: {method}. Using frequency method as fallback.")
+            self._prune_codebook_frequency_vectors(**kwargs)
+
+        self.logistic_classifier = None
+        self.knn_classifier = None
+        self.is_scaler_fitted = False
+
+    def _prune_codebook_frequency_vectors(self, min_occurrences=10, equality_threshold=0.05):
+        """
+        Frequency-based pruning using vector representations.
+        """
+        if "train" not in self.code_occurrence_overall or "vectors" not in self.code_occurrence_overall["train"]:
+            print("No training vectors available for pruning.")
+            return
+        
+        if not self.codebook:
+            print("No codebook available for pruning.")
+            return
+        
+        # Extend all vectors to current codebook size before processing
+        current_codes = list(self.codebook.keys())
+        self._extend_existing_vectors(self.code_occurrence_overall["train"], current_codes)
+        
+        train_vectors = np.array(list(self.code_occurrence_overall["train"]["vectors"].values()))
+        train_labels = np.array(self.code_occurrence_overall["train"]["labels"])
+        all_codes = list(self.codebook.keys())
+        original_codes = all_codes.copy()
+        
+        to_be_deleted_code = []
+        
+        for i, code in enumerate(all_codes):
+            if i >= train_vectors.shape[1]:
+                continue
+            
+            # Count occurrences for each model
+            model0_mask = train_labels == self.model_options[0]
+            model1_mask = train_labels == self.model_options[1]
+            
+            count_model0 = np.sum(train_vectors[model0_mask, i])
+            count_model1 = np.sum(train_vectors[model1_mask, i])
+            total_count = count_model0 + count_model1
+            
+            if total_count > min_occurrences:
+                ratio = count_model0 / total_count
+                lower_bound = 0.5 - equality_threshold
+                upper_bound = 0.5 + equality_threshold
+                if lower_bound < ratio < upper_bound:
+                    to_be_deleted_code.append(code)
+        
+        # Remove codes from codebook
+        for code in to_be_deleted_code:
+            del self.codebook[code]
+            print(f"Prune out {code}")
+        print(f"Now the codebook has {len(self.codebook.keys())} codes.")
+        
+        # Update vectors if codes were removed
+        if to_be_deleted_code:
+            print(f"Updating vector representations after pruning {len(to_be_deleted_code)} codes...")
+            for split in self.code_occurrence_overall.keys():
+                self._update_vectors_after_pruning(split, to_be_deleted_code, original_codes)
+            for split in self.decision_code_occurence_overall.keys():
+                self._update_vectors_after_pruning(split, to_be_deleted_code, original_codes, is_decision_code=True)
+    
+    def _prune_codebook_top_k_vectors(self):
+        """
+        Top-k pruning using vector representations.
+        """
+        k = self.max_rule
+        if k is None:
+            print("Error: k parameter is required for top_k pruning method.")
+            return
+        
+        if "train" not in self.code_occurrence_overall or "vectors" not in self.code_occurrence_overall["train"]:
+            print("No training vectors available for pruning.")
+            return
+        
+        if not self.codebook:
+            print("No codebook available for pruning.")
+            return
+        
+        # Extend all vectors to current codebook size before processing
+        current_codes = list(self.codebook.keys())
+        self._extend_existing_vectors(self.code_occurrence_overall["train"], current_codes)
+        
+        train_vectors = np.array(list(self.code_occurrence_overall["train"]["vectors"].values()))
+        train_labels = np.array(self.code_occurrence_overall["train"]["labels"])
+        all_codes = list(self.codebook.keys())
+        
+        code_scores = {}
+        
+        for i, code in enumerate(all_codes):
+            if i >= train_vectors.shape[1]:
+                code_scores[code] = 0
+                continue
+            
+            # Count occurrences for each model
+            model0_mask = train_labels == self.model_options[0]
+            model1_mask = train_labels == self.model_options[1]
+            
+            count_model0 = np.sum(train_vectors[model0_mask, i])
+            count_model1 = np.sum(train_vectors[model1_mask, i])
+            total_count = count_model0 + count_model1
+            
+            if total_count == 0:
+                code_scores[code] = 0
+            else:
+                ratio = count_model0 / total_count
+                discriminative_score = abs(ratio - 0.5) * total_count
+                code_scores[code] = discriminative_score
+        
+        # Sort and keep top k
+        sorted_codes = sorted(code_scores.items(), key=lambda x: x[1], reverse=True)
+        current_size = len(self.codebook)
+        k = min(k, current_size)
+        
+        if k >= current_size:
+            print(f"Requested k={k} is >= current codebook size ({current_size}). No pruning needed.")
+            return
+        
+        codes_to_keep = [code for code, score in sorted_codes[:k]]
+        codes_to_remove = [code for code in self.codebook.keys() if code not in codes_to_keep]
+        original_codes = all_codes.copy()
+        
+        print(f"Keeping top {k} most discriminative codes out of {current_size}")
+        print(f"Top 5 codes: {[code for code, score in sorted_codes[:5]]}")
+        
+        for code in codes_to_remove:
+            del self.codebook[code]
+            print(f"Prune out {code}")
+        print(f"Now the codebook has {len(self.codebook.keys())} codes.")
+        
+        # Update vectors if codes were removed
+        if codes_to_remove:
+            print(f"Updating vector representations after pruning {len(codes_to_remove)} codes...")
+            for split in self.code_occurrence_overall.keys():
+                self._update_vectors_after_pruning(split, codes_to_remove, original_codes)
+            for split in self.decision_code_occurence_overall.keys():
+                self._update_vectors_after_pruning(split, codes_to_remove, original_codes, is_decision_code=True)
+    
+    def _update_vectors_after_pruning(self, split, removed_codes, original_codes, is_decision_code=False):
+        """
+        Update stored vectors by removing dimensions corresponding to pruned codes.
+        
+        Args:
+            split (str): The data split to update
+            removed_codes (list): List of codes that were removed
+            original_codes (list): Original list of codes before pruning
+            is_decision_code (bool): Whether this is for decision codes
+        """
+        if is_decision_code:
+            data_dict = self.decision_code_occurence_overall[split]
+        else:
+            data_dict = self.code_occurrence_overall[split]
+            
+        if 'vectors' not in data_dict or not data_dict['vectors']:
+            return
+            
+        # Get the original code order
+        original_code_order = data_dict.get('code_order', original_codes)
+        
+        # Find indices of codes to remove
+        indices_to_remove = []
+        for code in removed_codes:
+            if code in original_code_order:
+                indices_to_remove.append(original_code_order.index(code))
+        
+        if not indices_to_remove:
+            return
+            
+        # Update vectors by removing specified dimensions
+        for key, vector in data_dict['vectors'].items():
+            # Remove the specified dimensions using numpy.delete
+            updated_vector = np.delete(vector, indices_to_remove)
+            data_dict['vectors'][key] = updated_vector
+        
+        # Update the code order
+        new_code_order = [code for code in original_code_order if code not in removed_codes]
+        data_dict['code_order'] = new_code_order
+        
+        print(f"Updated {len(data_dict['vectors'])} vectors in split '{split}' "
+              f"({'decision codes' if is_decision_code else 'regular codes'})")
+        print(f"Vector dimensions: {len(original_code_order)} -> {len(new_code_order)}")
+    
+    def eval(self, dataset, verbosity=5, batched=False, batch_size=4, ckpt_path=None, freq_estimate=False):
+        """
+        Override eval method to use vector-based storage.
+        """
+        assert batched and batch_size > 0, "Current evaluation must be done using batch"
+        if freq_estimate:
+            split = "train_est"
+        else:
+            split = "eval"
+        self.training_logs[split] = {}
+        self.code_occurrence_overall[split] = {}
+        self.decision_code_occurence_overall[split] = {}
+        
+        self.num_eval_samples = 0
+        self.num_eval_correct = 0
+        
+        self.eval_correct_ids = []
+        self.eval_wrong_ids = []
+        if batch_size > 0:
+            print("Report on every batch instead of verbosity")
+            verbosity = batch_size
+
+        if (ckpt_path is not None) and os.path.exists(ckpt_path):
+            print(f"Loading from pretrained attr from {ckpt_path}")
+            self.from_pretrained(filename=ckpt_path)
+        else:
+            print("EVAL FROM SCRATCH. No existing pretrained data found.")
+
+        start_at = self.num_eval_samples
+        
+        for i in tqdm(range(start_at, len(dataset), batch_size)):
+            batch = dataset[i:i+batch_size]
+            outputs = [item["outputs"] for item in batch]
+            labels = [item["labels"] for item in batch]
+            questions = [item["question"] for item in batch]
+            ids = [item["id"] for item in batch]
+            classification_prompts, classifications, evaluations, if_codebook_updated_list, final_outputs = self.classify(outputs, labels, questions, train=False, qid=ids, batched=True)
+            
+            for j, (classification_prompt, classification, evaluation) in enumerate(zip(classification_prompts, classifications, evaluations)):
+                code_occurrence, decision_code = self._parse_classification_codes(final_outputs[j], labels[j])
+                if_codebook_updated = if_codebook_updated_list[j]
+                self.training_logs[split][ids[j]] = {
+                    "input_prompt": classification_prompt,
+                    "output_classification": classification,
+                    "evaluation": evaluation,
+                    "updated": if_codebook_updated,
+                    "data": batch[j],
+                    "code_occurence": code_occurrence,
+                    "decision_code": decision_code,
+                }
+                
+                # Use vector-based storage
+                self._update_code_occurence_with_labels(
+                    self.code_occurrence_overall.setdefault(split, {}), 
+                    code_occurrence, labels[j], ids[j])
+                self._update_code_occurence_with_labels(
+                    self.decision_code_occurence_overall.setdefault(split, {}), 
+                    decision_code, labels[j], ids[j])
+
+                if evaluation == "correct":
+                    self.eval_correct_ids.append(ids[j])
+                    self.num_eval_correct += 1
+                else:
+                    self.eval_wrong_ids.append(ids[j])
+                self.num_eval_samples += 1
+            
+                if verbosity > 0 and self.num_eval_samples % verbosity == 0:
+                    accuracy = (self.num_eval_correct / self.num_eval_samples) * 100
+                    print(f"Validation Progress: {self.num_eval_samples}/{len(dataset)} ({self.num_eval_samples/len(dataset)*100:.2f}%)", flush=True)
+                    print(f"Accuracy so far: {accuracy:.2f}% ({self.num_eval_correct}/{self.num_eval_samples})", flush=True)
+                    print("-" * 50, flush=True)
+
+                    if ckpt_path is not None:
+                        self.save(ckpt_path)
+
+        if not freq_estimate:
+            final_accuracy = (self.num_eval_correct / self.num_eval_samples) * 100
+            print(f"\nFinal Validation Accuracy: {final_accuracy:.2f}% ({self.num_eval_correct}/{self.num_eval_samples})", flush=True)
+            print(f"Correctly classified IDs: {self.eval_correct_ids}", flush=True)
+            print(f"Incorrectly classified IDs: {self.eval_wrong_ids}", flush=True)
+            self.training_logs["eval_acc"] = final_accuracy
+            self.training_logs["eval_correct_ids"] = self.eval_correct_ids
+            self.training_logs["eval_wrong_ids"] = self.eval_wrong_ids
+
+        if ckpt_path is not None:
+            self.save(ckpt_path)
+    
+    def _update_sample_statistics(self, sample, classification_prompt, classification, evaluation, 
+                                if_codebook_updated, final_output, custom_logger, logger_kwargs):
+        """
+        Override to use vector-based storage instead of summary statistics.
+        """
+        # Parse codes using the base class method (codebook-based)
+        code_occurrence, decision_code = self._parse_classification_codes(final_output, sample["labels"])
+        
+        # Update training logs
+        self.training_logs["train"][sample['id']] = {
+            "input_prompt": classification_prompt,
+            "output_classification": classification,
+            "evaluation": evaluation,
+            "updated": if_codebook_updated,
+            "code_occurrence": code_occurrence,
+            "decision_code": decision_code,
+            "data": sample,
+            "cb_ckpt": deepcopy(self.codebook),
+        }
+        
+        # Update code occurrence tracking using vector-based storage
+        self._update_code_occurence_with_labels(
+            self.code_occurrence_overall.setdefault("train", {}), 
+            code_occurrence, sample["labels"], sample['id'])
+        self._update_code_occurence_with_labels(
+            self.decision_code_occurence_overall.setdefault("train", {}), 
+            decision_code, sample["labels"], sample['id'])
+        
+        # Update training statistics
+        if (isinstance(if_codebook_updated, (int, float)) and if_codebook_updated > 0) or (isinstance(if_codebook_updated, list) and len(if_codebook_updated) > 0 and if_codebook_updated[0] > 0):
+            self.train_wrong_ids.append(sample["id"])
+        elif evaluation == "correct":
+            self.train_correct_ids.append(sample["id"])
+            self.num_train_correct += 1
+        else:
+            self.train_wrong_ids.append(sample["id"])
+        
+        self.num_train_samples += 1
+        
+        if custom_logger:
+            custom_logger(**logger_kwargs)
+        
+        self.training_logs["train"][sample['id']]["current_train_acc"] = (self.num_train_correct / self.num_train_samples) * 100 
