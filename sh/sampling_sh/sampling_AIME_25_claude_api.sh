@@ -12,13 +12,10 @@ source activate rifeval
 
 # Set API keys - REQUIRED for API sampling
 # Uncomment and set your actual API keys:
-export ANTHROPIC_API_KEY_YEC="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"
 # export OPENAI_API_KEY_YEC="your-openai-api-key-here"  
 # export GOOGLE_API_KEY_YEC="your-google-api-key-here"
 
 # Alternative: Source from a secure file (recommended)
-# source ~/.api_keys  # Create this file with your API keys
-
 # Run Claude 3.7 Sonnet on AIME 25 dataset
 python sampling_py/sample_AIME_25_api.py \
     --model_id "claude-3-7-sonnet-20250219" \
